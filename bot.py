@@ -2,29 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-Personal Housing Finder - Zapopan (Unidad Deportiva El Briseño) + Telegram
+Personal Housing Finder - Zapopan (Unidad Deportiva El Briseño) + Telegram (Render-ready)
 
-Cambios importantes:
-- Telegram manda SIEMPRE un mensaje por corrida (aunque no haya nuevos)
-- Playwright mejorado: espera networkidle + scroll para lazy load
-- Inmuebles24: selectores/heurísticas más flexibles (links relativos incluidos)
-- Filtro por radio: por defecto incluye los que no se pueden geocodificar (para no quedar en 0)
-- Métricas de geocoding: geocoded vs unknown
+Highlights:
+- Playwright headless automático en Render
+- Fallback robusto para 403 (requests -> Playwright)
+- Si Playwright falla, no rompe la corrida (solo devuelve 0 para ese portal)
+- Telegram siempre manda resumen + Top 15 baratas
+- Geocoding limitado por corrida para no tardarse eternidad (Nominatim)
+- Progreso impreso en consola
 
-Instalar:
-  pip install requests beautifulsoup4
-  # opcional (si quieres):
-  pip install lxml
-  # navegador fallback:
-  pip install playwright
-  playwright install
+Requisitos:
+  pip install requests beautifulsoup4 playwright
+  python -m playwright install --with-deps chromium
 
-Variables de entorno:
-  TELEGRAM_BOT_TOKEN="..."
-  TELEGRAM_CHAT_ID="..."
+Env vars:
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID
 
-Ejecutar:
-  python bot.py
+Render Build Command recomendado:
+  pip install -r requirements.txt && python -m playwright install --with-deps chromium
+
+Render Schedule (10 PM Guadalajara):
+  Guadalajara UTC-6 => 22:00 local = 04:00 UTC
+  0 4 * * *
 """
 
 import json
@@ -47,18 +48,16 @@ from bs4 import BeautifulSoup
 PRICE_MIN = 1_500_000
 PRICE_MAX = 2_000_000
 
-# Centro: Unidad Deportiva El Briseño (aprox)
 HOME_LAT = 20.626058
 HOME_LON = -103.439071
-
 RADIUS_KM = 7.0
 
-MAX_GEOCODE_PER_RUN = 40     # empieza con 20–40
-SKIP_GEO_IF_LOCATION_TOO_GENERIC = True
-
-# CLAVE: para que no te quede todo en 0, dejamos pasar anuncios sin geocoding por ahora
-# Cuando ya tengas extracción de ubicación más fina, puedes regresarlo a False.
+# Para no quedarte en 0 si la ubicación es mala
 INCLUDE_UNKNOWN_GEO = True
+
+# Limita geocoding por corrida (Nominatim es lento y rate-limited)
+MAX_GEOCODE_PER_RUN = 40
+SKIP_GEO_IF_LOCATION_TOO_GENERIC = True
 
 DB_PATH = "housing.db"
 GEO_CACHE_PATH = Path("geocache.json")
@@ -71,25 +70,30 @@ SEARCH_URLS = {
     "vivanuncios": "https://www.vivanuncios.com.mx/s-casas-en-venta/zapopan/v1c1293l14828p1",
 }
 
-# BS4 parser (sin lxml por defecto)
-USE_LXML_IF_AVAILABLE = False
-BS4_PARSER = "lxml" if USE_LXML_IF_AVAILABLE else "html.parser"
+# BS4 parser
+BS4_PARSER = "html.parser"
 
+# Playwright fallback por portal (403 -> navegador real)
 USE_BROWSER_FALLBACK = {
     "inmuebles24": True,
     "mercadolibre": False,
     "vivanuncios": True,
 }
-BROWSER_HEADLESS = False
 
-# Telegram (env vars)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Render env: define RENDER="true" en Render internamente
+IS_RENDER = bool(os.getenv("RENDER"))
+
+# En Render SIEMPRE headless
+BROWSER_HEADLESS = True if IS_RENDER else False
+
+# Telegram env vars (NO hardcode)
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
-# Siempre manda mensaje por corrida
-ALWAYS_SEND_TELEGRAM_SUMMARY = True
-TELEGRAM_MAX_ITEMS = 8
+# Telegram: siempre manda resumen + Top 15
+ALWAYS_SEND_TELEGRAM = True
+TELEGRAM_MAX_ITEMS = 15
 
 # ----------------------------
 # HTTP SESSION
@@ -116,8 +120,8 @@ class Listing:
     url: str
     title: str
     price_mxn: Optional[int]
-    location: str  # texto (best effort)
-    distance_km: Optional[float] = None  # se llena si se puede
+    location: str
+    distance_km: Optional[float] = None
 
 
 # ----------------------------
@@ -128,7 +132,6 @@ def normalize_price_to_int(text: str) -> Optional[int]:
         return None
     t = text.upper().replace("\xa0", " ").strip()
 
-    # Formato "1.95M"
     m = re.search(r"(\d+(?:\.\d+)?)\s*M", t)
     if m:
         try:
@@ -177,30 +180,35 @@ def fetch_html_browser(url: str) -> str:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         raise RuntimeError(
-            "Playwright no está instalado. Instala con:\n"
-            "  python -m pip install playwright\n"
-            "  python -m playwright install\n"
+            "Playwright no está instalado. En Render usa build:\n"
+            "pip install -r requirements.txt && python -m playwright install --with-deps chromium"
         ) from e
 
     ua = SESSION.headers.get("User-Agent")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=BROWSER_HEADLESS)
+        browser = p.chromium.launch(
+            headless=BROWSER_HEADLESS,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context(user_agent=ua, locale="es-MX")
         page = context.new_page()
 
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # Espera a que carguen requests extra
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
 
         # Scroll para lazy-load
-        for _ in range(5):
-            page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(800)
+        for _ in range(6):
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(700)
+
+        title = (page.title() or "").lower()
+        if any(k in title for k in ["captcha", "attention", "verify", "robot", "cloudflare"]):
+            print(f"[WARN] Playwright posible botwall | title='{title}' | url={url}")
 
         html = page.content()
         browser.close()
@@ -209,10 +217,21 @@ def fetch_html_browser(url: str) -> str:
 
 def fetch_html(url: str, portal: str) -> str:
     r = SESSION.get(url, timeout=30)
+
     if r.status_code == 403 and USE_BROWSER_FALLBACK.get(portal, False):
         print(f"[INFO] {portal}: 403 con requests, intentando fallback navegador (Playwright)...")
-        return fetch_html_browser(url)
-    r.raise_for_status()
+        try:
+            return fetch_html_browser(url)
+        except Exception as e:
+            print(f"[WARN] {portal}: Playwright falló: {e}")
+            return ""
+
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[WARN] {portal}: requests falló: {e}")
+        return ""
+
     return r.text
 
 
@@ -284,18 +303,20 @@ def geocode_osm(query: str, cache: Dict[str, Optional[Dict[str, float]]]) -> Opt
 def compute_distance_km_for_listing(it: Listing, cache: Dict[str, Optional[Dict[str, float]]]) -> Optional[float]:
     loc = (it.location or "").strip()
 
-    # Si la ubicación es demasiado genérica, no gastes geocoding (sería basura y lento)
     if SKIP_GEO_IF_LOCATION_TOO_GENERIC:
-        generic_patterns = [
-            r"^zapopan$",
-            r"^zapopan,\s*jalisco$",
-            r"^jalisco$",
-            r"^guadalajara$",
-        ]
-        if not loc or any(re.match(p, loc.strip().lower()) for p in generic_patterns):
+        low = loc.lower().strip()
+        generic = {"zapopan", "zapopan, jalisco", "jalisco", "guadalajara", ""}
+        if low in generic:
             return None
 
-    # Enriquecer query
+    if not loc:
+        # usar título como pista, pero puede ser ruido
+        t = (it.title or "").strip()
+        loc = t if t else ""
+
+    if not loc:
+        return None
+
     query = loc
     if "ZAPOPAN" not in query.upper():
         query = f"{query}, Zapopan, Jalisco, México"
@@ -308,121 +329,71 @@ def compute_distance_km_for_listing(it: Listing, cache: Dict[str, Optional[Dict[
     return haversine_km(HOME_LAT, HOME_LON, lat, lon)
 
 
-def passes_radius_filter(it: Listing, cache: Dict[str, Optional[Dict[str, float]]]) -> bool:
-    dist = compute_distance_km_for_listing(it, cache)
-    it.distance_km = dist
-
-    if dist is None:
-        return INCLUDE_UNKNOWN_GEO
-
-    return dist <= RADIUS_KM
-
-
 # ----------------------------
 # TELEGRAM
 # ----------------------------
 def telegram_send_message(text: str) -> None:
     if not TELEGRAM_ENABLED:
-        print("[INFO] Telegram no configurado (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID).")
+        print("[INFO] Telegram OFF (faltan TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        r = SESSION.post(url, json=payload, timeout=30)
-        if r.status_code != 200:
-            print(f"[WARN] Telegram error {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"[WARN] Telegram exception: {e}")
+    r = SESSION.post(url, json=payload, timeout=30)
+    if r.status_code != 200:
+        print(f"[WARN] Telegram error {r.status_code}: {r.text[:200]}")
 
 
 def fmt_listing_line(it: Listing) -> str:
     p = f"${it.price_mxn:,}" if isinstance(it.price_mxn, int) else "s/p"
-    loc = it.location or "sin ubicación"
     d = f"{it.distance_km:.1f} km" if isinstance(it.distance_km, float) else "dist ?"
+    loc = it.location or "sin ubicación"
     return f"• [{it.portal}] {p} ({d})\n{loc}\n{it.url}"
-  
-def send_cheapest_summary(filtered_items: List[Listing]) -> None:
-    if not TELEGRAM_ENABLED:
-        return
-
-    # Quita los que no tienen precio
-    priced = [x for x in filtered_items if isinstance(x.price_mxn, int)]
-
-    # Ordena por precio
-    priced.sort(key=lambda x: x.price_mxn)
-
-    cheapest = priced[:15]
-
-    header = (
-        "💸 Top 15 más baratas\n"
-        f"📍 ≤ {RADIUS_KM} km | {PRICE_MIN:,}-{PRICE_MAX:,} MXN\n\n"
-    )
-
-    if not cheapest:
-        telegram_send_message(header + "No se encontraron propiedades con precio válido.")
-        return
-
-    lines = []
-    for it in cheapest:
-        p = f"${it.price_mxn:,}"
-        d = f"{it.distance_km:.1f} km" if isinstance(it.distance_km, float) else "dist ?"
-        lines.append(
-            f"{p} ({d})\n{it.url}"
-        )
-
-    telegram_send_message(header + "\n\n".join(lines))
 
 
-def send_run_summary(
+def send_summary_and_top15(
     portal_counts: Dict[str, int],
-    after_radius_count: int,
+    filtered: List[Listing],
     new_items: List[Listing],
-    sample_items: List[Listing],
     geocoded_ok: int,
     geocoded_unknown: int,
 ) -> None:
-    # Siempre mandamos summary (si está activado)
-    if not (TELEGRAM_ENABLED and ALWAYS_SEND_TELEGRAM_SUMMARY):
+    if not ALWAYS_SEND_TELEGRAM:
         if new_items:
-            # fallback mínimo si alguien desactiva ALWAYS_SEND...
-            telegram_send_message(f"🏠 Nuevos: {len(new_items)}")
+            telegram_send_message(f"🆕 Nuevos: {len(new_items)}")
         return
 
     header = (
         "🏠 Corrida completada (El Briseño)\n"
         f"💰 {PRICE_MIN:,}–{PRICE_MAX:,} MXN | 📍 ≤ {RADIUS_KM} km\n"
-        f"📦 Portales: " + ", ".join([f"{k}:{v}" for k, v in portal_counts.items()]) + "\n"
-        f"🧭 Tras radio: {after_radius_count}\n"
+        "📦 Portales: " + ", ".join([f"{k}:{v}" for k, v in portal_counts.items()]) + "\n"
+        f"🧭 Tras filtros: {len(filtered)} | 🆕 Nuevos: {len(new_items)}\n"
         f"🗺️ Geocode ok:{geocoded_ok} | unknown:{geocoded_unknown}\n"
-        f"🆕 Nuevos: {len(new_items)}\n"
     )
 
-    # Si hay nuevos, listarlos; si no, mandar muestra del top actual
-    lines: List[str] = []
-    if new_items:
-        for it in new_items[:TELEGRAM_MAX_ITEMS]:
-            lines.append(fmt_listing_line(it))
-        if len(new_items) > TELEGRAM_MAX_ITEMS:
-            lines.append(f"(+{len(new_items) - TELEGRAM_MAX_ITEMS} más en DB)")
-        body = "\n\n".join(lines)
-        telegram_send_message(header + "\n" + body)
-    else:
-        # Muestra algunos resultados actuales (para que “siempre mande algo”)
-        for it in sample_items[:TELEGRAM_MAX_ITEMS]:
-            lines.append(fmt_listing_line(it))
-        body = "\n\n".join(lines) if lines else "Sin resultados tras filtros (revisa geocoding/portal)."
-        telegram_send_message(header + "\n" + body)
+    # Top 15 más baratas con precio válido
+    priced = [x for x in filtered if isinstance(x.price_mxn, int)]
+    priced.sort(key=lambda x: x.price_mxn)
+    top = priced[:TELEGRAM_MAX_ITEMS]
+
+    if not top:
+        telegram_send_message(header + "\n(No hay resultados con precio parseado aún.)")
+        return
+
+    body = "\n\n".join(fmt_listing_line(x) for x in top)
+    telegram_send_message(header + "\n💸 Top 15 más baratas:\n\n" + body)
 
 
 # ----------------------------
 # SCRAPERS
 # ----------------------------
-def scrape_inmuebles24(search_url: str) -> List[Listing]:
-    html = fetch_html(search_url, "inmuebles24")
+def scrape_inmuebles24(url: str) -> List[Listing]:
+    html = fetch_html(url, "inmuebles24")
+    if not html:
+        return []
+
     soup = BeautifulSoup(html, BS4_PARSER)
     out: List[Listing] = []
-
     base = "https://www.inmuebles24.com"
 
     for a in soup.select("a[href]"):
@@ -430,22 +401,13 @@ def scrape_inmuebles24(search_url: str) -> List[Listing]:
         if not href:
             continue
 
-        # normaliza URL
-        if href.startswith("/"):
-            full = urljoin(base, href)
-        else:
-            full = href
-
+        full = urljoin(base, href) if href.startswith("/") else href
         if "inmuebles24.com" not in full:
             continue
-
-        # Heurística: evita navegación/anchors y queda con links “profundos”
         if any(x in full for x in ["javascript:", "mailto:", "#"]):
             continue
         if "/casas-en-venta" in full:
             continue
-
-        # Intentar capturar detalle: suele ser url larga
         if len(full) < 35:
             continue
 
@@ -462,20 +424,21 @@ def scrape_inmuebles24(search_url: str) -> List[Listing]:
             if cand_price:
                 price_text = str(cand_price)
 
-            # busca texto de ubicación en el card
             cand_loc = card.find(string=re.compile(r"Zapopan|Jalisco|El Briseño|Briseño|Guadalajara", re.I))
             if cand_loc:
                 location_text = str(cand_loc).strip()
 
         price = normalize_price_to_int(price_text)
-
         out.append(Listing("inmuebles24", full.split("#")[0], title[:200], price, location_text[:200]))
 
     return dedup_by_url(out)
 
 
-def scrape_mercadolibre(search_url: str) -> List[Listing]:
-    html = fetch_html(search_url, "mercadolibre")
+def scrape_mercadolibre(url: str) -> List[Listing]:
+    html = fetch_html(url, "mercadolibre")
+    if not html:
+        return []
+
     soup = BeautifulSoup(html, BS4_PARSER)
     out: List[Listing] = []
 
@@ -507,8 +470,11 @@ def scrape_mercadolibre(search_url: str) -> List[Listing]:
     return dedup_by_url(out)
 
 
-def scrape_vivanuncios(search_url: str) -> List[Listing]:
-    html = fetch_html(search_url, "vivanuncios")
+def scrape_vivanuncios(url: str) -> List[Listing]:
+    html = fetch_html(url, "vivanuncios")
+    if not html:
+        return []
+
     soup = BeautifulSoup(html, BS4_PARSER)
     out: List[Listing] = []
     base = "https://www.vivanuncios.com.mx"
@@ -518,11 +484,8 @@ def scrape_vivanuncios(search_url: str) -> List[Listing]:
         if not href:
             continue
 
-        if href.startswith("/"):
-            full = urljoin(base, href)
-        elif "vivanuncios.com.mx" in href:
-            full = href
-        else:
+        full = urljoin(base, href) if href.startswith("/") else href
+        if "vivanuncios.com.mx" not in full:
             continue
 
         title = a.get_text(" ", strip=True)
@@ -590,73 +553,52 @@ def upsert(conn: sqlite3.Connection, items: Iterable[Listing]) -> List[Listing]:
 
 
 # ----------------------------
-# RUN
+# MAIN
 # ----------------------------
-def run_all() -> Dict[str, List[Listing]]:
-    results: Dict[str, List[Listing]] = {}
-
-    for portal, url in SEARCH_URLS.items():
-        try:
-            if portal == "inmuebles24":
-                items = scrape_inmuebles24(url)
-            elif portal == "mercadolibre":
-                items = scrape_mercadolibre(url)
-            elif portal == "vivanuncios":
-                items = scrape_vivanuncios(url)
-            else:
-                items = []
-
-            # precio: deja pasar None (best effort)
-            items = [x for x in items if x.price_mxn is None or in_price_range(x.price_mxn)]
-            results[portal] = items
-
-        except Exception as e:
-            print(f"[WARN] {portal} falló: {e}")
-            results[portal] = []
-
-    return results
-
-
 def main() -> None:
     print("== Personal Housing Finder (El Briseño) + Telegram ==")
     print(f"Precio: {PRICE_MIN:,} - {PRICE_MAX:,} MXN")
     print(f"Centro: {HOME_LAT}, {HOME_LON} | Radio: {RADIUS_KM} km")
     print(f"Parser BS4: {BS4_PARSER}")
+    print(f"Render: {IS_RENDER} | Playwright headless: {BROWSER_HEADLESS}")
     print(f"Telegram: {'ON' if TELEGRAM_ENABLED else 'OFF'}")
-    print(f"Browser fallback: {USE_BROWSER_FALLBACK} (headless={BROWSER_HEADLESS})\n")
+    print(f"Browser fallback: {USE_BROWSER_FALLBACK}\n")
 
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    by_portal = run_all()
+    # Run scrapers
+    portal_items: Dict[str, List[Listing]] = {
+        "inmuebles24": scrape_inmuebles24(SEARCH_URLS["inmuebles24"]),
+        "mercadolibre": scrape_mercadolibre(SEARCH_URLS["mercadolibre"]),
+        "vivanuncios": scrape_vivanuncios(SEARCH_URLS["vivanuncios"]),
+    }
+    portal_counts = {k: len(v) for k, v in portal_items.items()}
 
-    portal_counts = {k: len(v) for k, v in by_portal.items()}
+    for k, v in portal_counts.items():
+        print(f"{k}: {v} items (best effort)")
 
     all_items: List[Listing] = []
-    for portal, items in by_portal.items():
-        print(f"{portal}: {len(items)} items (best effort)")
-        all_items.extend(items)
+    for items in portal_items.values():
+        # filtra por precio si viene parseado
+        all_items.extend([x for x in items if x.price_mxn is None or in_price_range(x.price_mxn)])
 
-    # Filtro por radio
+    # Filtro por radio con geocoding limitado
     cache = load_geo_cache()
-    before = len(all_items)
-
     filtered: List[Listing] = []
     geocoded_ok = 0
     geocoded_unknown = 0
     geo_used = 0
 
     total = len(all_items)
+    print(f"\nTotal candidatos pre-radio: {total}")
     for idx, it in enumerate(all_items, start=1):
-        # Progreso cada 25 items
         if idx % 25 == 0:
-            print(f"[PROGRESS] {idx}/{total} | geo_used={geo_used}/{MAX_GEOCODE_PER_RUN} | kept={len(filtered)}")
+            print(f"[PROGRESS] {idx}/{total} geo_used={geo_used}/{MAX_GEOCODE_PER_RUN} kept={len(filtered)}")
 
-        # filtro por precio si está parseado
         if it.price_mxn is not None and not in_price_range(it.price_mxn):
             continue
 
-        # Si ya gastamos el presupuesto de geocoding, no geocodifiques más
         dist = None
         if geo_used < MAX_GEOCODE_PER_RUN:
             dist = compute_distance_km_for_listing(it, cache)
@@ -676,27 +618,16 @@ def main() -> None:
 
     save_geo_cache(cache)
 
-    after = len(filtered)
-    print(f"\nFiltro radio: {before} -> {after} (dentro de {RADIUS_KM} km o unknown={INCLUDE_UNKNOWN_GEO})\n")
-
-    new_items = upsert(conn, filtered)
-
-    print("=== NUEVOS (precio y radio) ===")
-    for it in new_items[:50]:
-        p = f"${it.price_mxn:,}" if isinstance(it.price_mxn, int) else "s/p"
-        loc = it.location or "sin ubicación"
-        d = f"{it.distance_km:.1f} km" if isinstance(it.distance_km, float) else "dist ?"
-        print(f"- [{it.portal}] {p} | {d} | {loc} | {it.title}\n  {it.url}")
-
-    print(f"\nTotal nuevos: {len(new_items)}")
+    print(f"\nTras filtros (radio/unknown): {len(filtered)}")
+    print(f"Geocode ok={geocoded_ok} unknown={geocoded_unknown}")
     print(f"DB: {DB_PATH} | Geocache: {GEO_CACHE_PATH}\n")
 
-    # Enviar SIEMPRE summary a Telegram:
-    # - si hay nuevos: lista nuevos
-    # - si no hay: manda una muestra del “top actual” para confirmar que corre
-    sample_items = filtered[:TELEGRAM_MAX_ITEMS]
-    send_run_summary(portal_counts, after, new_items, sample_items, geocoded_ok, geocoded_unknown)
-    send_cheapest_summary(filtered)
+    # Persist
+    new_items = upsert(conn, filtered)
+    print(f"Total nuevos: {len(new_items)}\n")
+
+    # Telegram
+    send_summary_and_top15(portal_counts, filtered, new_items, geocoded_ok, geocoded_unknown)
 
 
 if __name__ == "__main__":
